@@ -2,6 +2,9 @@
 #
 # Build, sign, notarize and package Plate.app as a distributable DMG.
 #
+# The .app is a universal binary (arm64 + x86_64) — one download serves every
+# Mac, which is what Sparkle's single update feed expects.
+#
 # The GitHub Actions release job does the same thing (.github/workflows/build.yml);
 # this script exists so a release can be cut — or debugged — from a laptop
 # without pushing a tag.
@@ -22,7 +25,7 @@
 #   NOTARY_ISSUER_ID  The key's Issuer ID.
 #
 # Usage:
-#   scripts/release-macos.sh [--arch arm64|x86_64] [--skip-notarize]
+#   scripts/release-macos.sh [--skip-notarize]
 #
 #   --skip-notarize produces a signed-but-unnotarized DMG. Useful to check the
 #   signing half of the pipeline without burning a notarization round-trip;
@@ -31,22 +34,15 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ARCH="$(uname -m)"
 SKIP_NOTARIZE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --arch) ARCH="$2"; shift 2 ;;
         --skip-notarize) SKIP_NOTARIZE=1; shift ;;
-        -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
-
-case "$ARCH" in
-    arm64|x86_64) ;;
-    *) echo "unsupported --arch: $ARCH (expected arm64 or x86_64)" >&2; exit 2 ;;
-esac
 
 # ---------------------------------------------------------------- identity ---
 
@@ -100,17 +96,20 @@ echo "==> Generating Xcode project"
 echo "==> Cleaning $BUILD_DIR"
 rm -rf "$BUILD_DIR"
 
-echo "==> Building Release ($ARCH)"
+echo "==> Building Release (universal: arm64 + x86_64)"
 (
     cd "$REPO_ROOT/PlateApp"
     set -o pipefail
+    # ARCHS with both slices + ONLY_ACTIVE_ARCH=NO yields a universal binary.
+    # The macos-15 CI runner is Apple Silicon, so the x86_64 slice is
+    # cross-compiled — the SDK carries both.
     xcodebuild \
         -project PlateApp.xcodeproj \
         -scheme PlateApp \
         -configuration Release \
         -derivedDataPath build \
         -destination 'platform=macOS' \
-        ARCHS="$ARCH" \
+        ARCHS="arm64 x86_64" \
         ONLY_ACTIVE_ARCH=NO \
         build \
         CODE_SIGN_IDENTITY="$SIGN_IDENTITY" \
@@ -119,6 +118,22 @@ echo "==> Building Release ($ARCH)"
         OTHER_CODE_SIGN_FLAGS="--timestamp" \
         | { command -v xcbeautify >/dev/null && xcbeautify || cat; }
 )
+
+# Prove both slices are actually present — a misconfigured ARCHS silently
+# yields a thin binary that only runs on the build machine's architecture.
+echo "==> Architectures in the binary:"
+lipo -archs "$APP/Contents/MacOS/Plate"
+for arch in arm64 x86_64; do
+    lipo -archs "$APP/Contents/MacOS/Plate" | grep -qw "$arch" \
+        || { echo "!! universal build is missing the $arch slice" >&2; exit 1; }
+done
+
+# ---------------------------------------------------------------- deep sign ---
+
+# xcodebuild leaves Sparkle's nested helpers (Autoupdate, Updater.app, the XPC
+# services) signed by Sparkle without a secure timestamp, which notarization
+# rejects. Re-sign them — and re-seal the framework and app — with our identity.
+SIGN_IDENTITY="$SIGN_IDENTITY" "$REPO_ROOT/scripts/codesign-app.sh" "$APP"
 
 # ------------------------------------------------------------------ verify ---
 
@@ -171,7 +186,7 @@ fi
 
 # ------------------------------------------------------------- package DMG ---
 
-DMG="$DIST/Plate-macos-$ARCH.dmg"
+DMG="$DIST/Plate-macos-universal.dmg"
 STAGE="$(mktemp -d)"
 
 cp -R "$APP" "$STAGE/Plate.app"

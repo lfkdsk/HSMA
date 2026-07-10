@@ -1,9 +1,19 @@
 import AppKit
+import Sparkle
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var welcomeWC: WelcomeWindowController?
     private var didBecomeKeyObserver: Any?
+
+    /// Sparkle's turnkey controller: owns the updater and the standard user
+    /// interface — the "update available" prompt, download progress, and the
+    /// install-and-relaunch. It's configured entirely through the SU* keys in
+    /// Info.plist (feed URL, public key, check interval), so there is no other
+    /// setup here. Created with `startingUpdater: true`, it runs its own
+    /// scheduled background checks; the menu command below just triggers a
+    /// manual one.
+    private var updaterController: SPUStandardUpdaterController?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // Instantiate the document controller BEFORE NSDocumentController.shared
@@ -25,15 +35,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.routeInitialLaunch()
         }
 
-        // Silent, throttled (once/day) update check against GitHub Releases.
-        // Never nags: only surfaces a prompt when a newer version exists.
-        UpdateCoordinator.checkOnLaunchIfDue()
+        // Hand update checking to Sparkle: a scheduled background check (daily,
+        // per SUScheduledCheckInterval) plus the manual menu command below. It
+        // downloads the DMG, verifies its EdDSA and Developer ID signatures,
+        // and prompts before installing and relaunching.
+        updaterController = SPUStandardUpdaterController(
+            startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
     }
 
-    /// App ▸ Check for Updates… — manual check that always reports back
-    /// (newer / up-to-date / error). Reaches here via the responder chain.
+    /// App ▸ Check for Updates… — routed here through the responder chain and
+    /// forwarded to Sparkle, which either offers the update or reports that the
+    /// app is up to date.
     @objc func checkForUpdatesFromMenu(_ sender: Any?) {
-        UpdateCoordinator.checkManually()
+        updaterController?.checkForUpdates(sender)
     }
 
     /// Reopens the most recent library if one exists, otherwise shows the welcome

@@ -4,10 +4,12 @@ Plate ships outside the Mac App Store, so its releases take the Developer ID
 route: a **Developer ID Application** signature, the **hardened runtime**, and
 an Apple **notarization** ticket stapled to both the `.app` and the `.dmg`.
 That combination is what lets a downloaded build open on a double-click instead
-of "Plate.app cannot be opened because the developer cannot be verified".
+of "Plate.app cannot be opened because the developer cannot be verified" — and
+it's the prerequisite for the in-app [Sparkle auto-update](#sparkle-auto-update),
+which will only install a signed, identity-matched replacement.
 
-Everything below is done once. After that, pushing a `v*` tag produces signed,
-notarized DMGs on its own.
+Everything below is done once. After that, pushing a `v*` tag produces a signed,
+notarized DMG and publishes the Sparkle update feed on its own.
 
 - Team ID: `R6QM7B7GB7` — the paid team. The free personal team `PZKFWN2C3U`,
   which the *Apple Development* certificate belongs to, cannot sign releases;
@@ -77,6 +79,7 @@ Add five repository secrets (Settings ▸ Secrets and variables ▸ Actions):
 | `NOTARY_KEY_P8` | The App Store Connect `.p8` key, base64-encoded |
 | `NOTARY_KEY_ID` | The key's Key ID |
 | `NOTARY_ISSUER_ID` | The key's Issuer ID |
+| `SPARKLE_PRIVATE_KEY` | The Sparkle EdDSA private key (base64, one line) — signs the update feed. See [Sparkle auto-update](#sparkle-auto-update). |
 
 To export the certificate: Keychain Access ▸ **My Certificates** ▸ right-click
 the *Developer ID Application* entry ▸ Export. Pick `.p12` and set a password.
@@ -148,3 +151,65 @@ quarantine attribute themselves:
 ```sh
 xattr -d com.apple.quarantine plate-cli
 ```
+
+## Sparkle auto-update
+
+The app updates itself in place with [Sparkle](https://sparkle-project.org).
+This is only safe because releases are Developer ID signed and notarized:
+Sparkle downloads the new DMG, verifies both its **EdDSA signature** (against
+the public key in `Info.plist`) and that its **code-signing identity matches
+the running app**, then installs and relaunches. Neither check could pass for
+the old ad-hoc builds.
+
+The pieces:
+
+- **`SUFeedURL`** (`Info.plist`) → `https://lfkdsk.github.io/Plate/appcast.xml`,
+  served from GitHub Pages.
+- **`SUPublicEDKey`** (`Info.plist`) → the EdDSA public key. Its private half
+  lives in the maintainer's login keychain and the `SPARKLE_PRIVATE_KEY` secret.
+- **The universal DMG** is the update enclosure — one download for every Mac,
+  because Sparkle serves a single feed and does not pick by architecture.
+
+### The EdDSA key
+
+Distinct from every Apple credential above. Generate it once with the
+`generate_keys` tool that ships inside the resolved Sparkle package:
+
+```sh
+BIN=$(find ~/Library/Developer/Xcode/DerivedData -path '*artifacts/sparkle/Sparkle/bin' | head -1)
+"$BIN/generate_keys"                       # stores the private key in the keychain, prints SUPublicEDKey
+"$BIN/generate_keys" -x sparkle_key.txt    # export the private key to back up + upload as the secret
+gh secret set SPARKLE_PRIVATE_KEY < sparkle_key.txt
+```
+
+The secret is the exported file's contents **verbatim** — `sign_update` reads it
+with `--ed-key-file -`. Don't base64-encode it again; that yields a double-encoded
+key and `sign_update` fails with "Imported key must be 64 bytes … instead it is 44".
+Unlike the `.p12` and `.p8`, this one is already a single text line.
+
+> **Back up the private key.** It is the root of trust for every future update.
+> Lose it and you can never ship another Sparkle update — existing installs
+> would reject a feed signed by a different key, forcing everyone to reinstall
+> by hand. Keep a copy in a password manager.
+
+### Deep-signing the Sparkle helpers
+
+`Sparkle.framework` embeds helpers — `Autoupdate`, `Updater.app`, and the
+`Downloader` / `Installer` XPC services — that xcodebuild does **not** re-sign;
+they keep Sparkle's own signature with no secure timestamp, and notarization
+rejects them. `scripts/codesign-app.sh` re-signs them inside-out with our
+identity before the app is notarized. Both the release script and CI call it.
+
+### Version-number discipline
+
+Sparkle decides "newer" by comparing the appcast's `<sparkle:version>`
+(`CFBundleVersion`) against the installed build — **not** the marketing
+`CFBundleShortVersionString`. So every release must bump `CFBundleVersion` in
+`PlateApp/PlateApp/Info.plist`, or clients won't see the update. The appcast is
+generated from the built app's `Info.plist`, so the two can't drift.
+
+### Enabling GitHub Pages (one-time)
+
+The `deploy-pages` job publishes `appcast.xml`. For it to work, enable Pages
+with **Settings ▸ Pages ▸ Build and deployment ▸ Source = GitHub Actions**.
+Until then the feed 404s and the app simply never finds an update.

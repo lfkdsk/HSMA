@@ -37,6 +37,9 @@ settings:
 packages:
   PlateCore:
     path: ..
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: "2.9.4"
 
 targets:
   PlateApp:
@@ -49,6 +52,8 @@ targets:
     dependencies:
       - package: PlateCore
         product: PlateCore
+      - package: Sparkle
+        product: Sparkle
     settings:
       # Nothing signing-related belongs here: target settings outrank the
       # project's per-configuration values above, so a stray

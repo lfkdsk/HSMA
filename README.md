@@ -42,16 +42,17 @@ GitHub Actions on every push to `main` (and tags `v*`):
 
 - `test-core` — `swift test` for PlateCore
 - `build-debug` — verifies the AppKit target compiles (Debug `.app` uploaded on every run, incl. PRs)
-- `build-release` — a per-architecture matrix (`arm64` + `x86_64`, built separately) producing, for each slice:
-  - `Plate-macos-<arch>.dmg` — the `.app`, Developer ID signed and notarized
-  - `plate-cli-macos-<arch>.tar.gz` — the CLI plus its PlateCore resource bundle (ad-hoc signed)
+- `build-release` — one universal build (`arm64` + `x86_64` in a single binary) producing:
+  - `Plate-macos-universal.dmg` — the `.app`, Developer ID signed and notarized
+  - `plate-cli-macos-<arch>.tar.gz` — the CLI plus its PlateCore resource bundle (ad-hoc signed), one per arch
   - a `.sha256` sidecar for each
+  - `appcast.xml` — the Sparkle update feed (on `v*` tags)
 
-  Uploaded as 90-day workflow artifacts; all four (plus checksums) are attached to a GitHub Release when a `v*` tag is pushed. The `macos` runner is Apple Silicon, so the `x86_64` slice is cross-compiled (`ARCHS` / `--arch`).
+  Uploaded as 90-day workflow artifacts; the DMG and CLI tars are attached to a GitHub Release on a `v*` tag, and the appcast is published to GitHub Pages. The `macos` runner is Apple Silicon, so the `x86_64` slice is cross-compiled.
 
-## Signing
+## Signing & auto-update
 
-Release `.dmg`s are signed with a Developer ID certificate and notarized by Apple, so they open without a Gatekeeper detour. Setup, required repository secrets, and how to cut a signed build from a laptop: [docs/SIGNING.md](docs/SIGNING.md).
+Release `.dmg`s are signed with a Developer ID certificate and notarized by Apple, so they open without a Gatekeeper detour — and the app updates itself in place via [Sparkle](https://sparkle-project.org), which only installs a signed, identity-matched build. Setup, the six repository secrets, the EdDSA update key, GitHub Pages, and how to cut a signed build from a laptop: [docs/SIGNING.md](docs/SIGNING.md).
 
 ## License
 
