@@ -43,11 +43,15 @@ GitHub Actions on every push to `main` (and tags `v*`):
 - `test-core` — `swift test` for PlateCore
 - `build-debug` — verifies the AppKit target compiles (Debug `.app` uploaded on every run, incl. PRs)
 - `build-release` — a per-architecture matrix (`arm64` + `x86_64`, built separately) producing, for each slice:
-  - `Plate-macos-<arch>.zip` — the ad-hoc-signed `.app`
-  - `plate-cli-macos-<arch>.tar.gz` — the CLI plus its PlateCore resource bundle
+  - `Plate-macos-<arch>.dmg` — the `.app`, Developer ID signed and notarized
+  - `plate-cli-macos-<arch>.tar.gz` — the CLI plus its PlateCore resource bundle (ad-hoc signed)
   - a `.sha256` sidecar for each
 
   Uploaded as 90-day workflow artifacts; all four (plus checksums) are attached to a GitHub Release when a `v*` tag is pushed. The `macos` runner is Apple Silicon, so the `x86_64` slice is cross-compiled (`ARCHS` / `--arch`).
+
+## Signing
+
+Release `.dmg`s are signed with a Developer ID certificate and notarized by Apple, so they open without a Gatekeeper detour. Setup, required repository secrets, and how to cut a signed build from a laptop: [docs/SIGNING.md](docs/SIGNING.md).
 
 ## License
 

@@ -75,10 +75,15 @@ jobs:
   # runner is Apple Silicon, so x86_64 is cross-compiled (ARCHS / --arch — the
   # SDK carries both slices). arm64 and x86_64 are built *separately* (not a
   # lipo'd universal binary). Each arch produces:
-  #   - Plate-macos-<arch>.zip          the .app, ad-hoc signed
+  #   - Plate-macos-<arch>.dmg          the .app, Developer ID signed + notarized
   #   - plate-cli-macos-<arch>.tar.gz   the CLI + its PlateCore resource bundle
   # each with a .sha256 sidecar, uploaded as workflow artifacts. On a v* tag the
   # separate publish-release job collects them into one GitHub Release.
+  #
+  # Signing needs five repository secrets (see docs/SIGNING.md). When they are
+  # absent — a fork, or a repo that hasn't been set up yet — the job falls back
+  # to ad-hoc signing and skips notarization, so the build still goes green. The
+  # DMG it produces is then NOT distributable; only tag builds from this repo are.
   build-release:
     name: Release (${{ matrix.arch }})
     needs: test-core
@@ -90,11 +95,69 @@ jobs:
       fail-fast: false
       matrix:
         arch: [arm64, x86_64]
+    env:
+      # `if:` conditions can't read `secrets`, so the steps below test these
+      # instead and branch in bash.
+      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+      NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+      NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install xcodegen + xcbeautify
         run: brew install xcodegen xcbeautify
+
+      # Certificates can only be used from an unlocked keychain, and the
+      # runner's `login` keychain isn't one we can rely on. Build a throwaway
+      # keychain, import the .p12 into it, and make it searchable so codesign
+      # finds the identity by name.
+      - name: Import Developer ID certificate
+        id: signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${MACOS_CERTIFICATE_P12:-}" ]; then
+            echo "::warning::No signing secrets — falling back to ad-hoc, skipping notarization."
+            echo "identity=-" >> "$GITHUB_OUTPUT"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          CERT="$RUNNER_TEMP/certificate.p12"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # Without this the keychain re-locks after 5 minutes of idle and a
+          # slow build reaches codesign with nothing to sign with.
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$CERT"
+          security import "$CERT" -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$CERT"
+
+          # Authorises codesign to use the private key without an interactive
+          # "allow access?" prompt, which would hang the runner forever.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::The imported certificate is not a 'Developer ID Application' identity."
+            security find-identity -v -p codesigning "$KEYCHAIN"
+            exit 1
+          fi
+
+          echo "Using identity: $IDENTITY"
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "keychain=$KEYCHAIN" >> "$GITHUB_OUTPUT"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
 
       # ---- macOS .app (this arch) ----
       - name: Generate Xcode project
@@ -104,8 +167,20 @@ jobs:
       - name: xcodebuild Release (${{ matrix.arch }})
         working-directory: PlateApp
         shell: bash
+        env:
+          NSUnbufferedIO: YES
+          SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          SIGNED: ${{ steps.signing.outputs.signed }}
+          KEYCHAIN: ${{ steps.signing.outputs.keychain }}
         run: |
-          set -o pipefail
+          set -euo pipefail
+          # A secure timestamp is required for notarization but unsupported for
+          # ad-hoc signatures, so it only goes on the real-identity path.
+          EXTRA=()
+          if [ "$SIGNED" = "true" ]; then
+            EXTRA+=(OTHER_CODE_SIGN_FLAGS="--timestamp --keychain $KEYCHAIN")
+          fi
+
           xcodebuild \
             -project PlateApp.xcodeproj \
             -scheme PlateApp \
@@ -115,27 +190,112 @@ jobs:
             ARCHS=${{ matrix.arch }} \
             ONLY_ACTIVE_ARCH=NO \
             build \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="$SIGN_IDENTITY" \
+            CODE_SIGN_STYLE=Manual \
+            ENABLE_HARDENED_RUNTIME=YES \
+            "${EXTRA[@]}" \
             | xcbeautify
-        env:
-          NSUnbufferedIO: YES
 
-      - name: Ad-hoc sign + zip Plate.app (${{ matrix.arch }})
+      - name: Verify the signature (${{ matrix.arch }})
         working-directory: PlateApp/build/Build/Products/Release
         shell: bash
         run: |
           set -euo pipefail
-          # Apple Silicon refuses to launch a fully-unsigned binary; an ad-hoc
-          # signature is the minimum that runs (mirrors the local release flow).
-          codesign --force --deep --sign - Plate.app
-          codesign --verify --deep --strict Plate.app
-          # ditto (not plain zip) keeps the bundle's extended attributes intact.
-          ZIP="Plate-macos-${{ matrix.arch }}.zip"
-          ditto -c -k --keepParent Plate.app "$ZIP"
-          shasum -a 256 "$ZIP" > "$ZIP.sha256"
-          echo "Built $ZIP ($(du -h "$ZIP" | cut -f1))"
+          codesign --verify --deep --strict --verbose=2 Plate.app
+
+          # Both are hard preconditions for notarization — get-task-allow
+          # disqualifies, a missing runtime flag disqualifies. Failing here
+          # beats failing five minutes into a notarytool round-trip.
+          #
+          # Capture before grepping, don't pipe: under `pipefail`, `grep -q`
+          # exits on its first match, codesign takes a SIGPIPE, and the pipeline
+          # reports 141 despite the match. `codesign -dvvv` writes enough to
+          # trip this every time; the entitlements output happens not to. It
+          # turns on output size against the pipe buffer, and the get-task-allow
+          # check would fail *open* — so neither is piped.
+          #
+          # Note the -dvvv: the "flags=" line only shows at verbosity 3.
+          SIGNATURE="$(codesign -dvvv Plate.app 2>&1)"
+          if ! printf '%s\n' "$SIGNATURE" | grep -qE "flags=[^ ]*runtime"; then
+            echo "::error::Plate.app is not signed with the hardened runtime."
+            exit 1
+          fi
+
+          ENTITLEMENTS="$(codesign --display --entitlements :- Plate.app 2>/dev/null || true)"
+          if printf '%s\n' "$ENTITLEMENTS" | grep -q get-task-allow; then
+            echo "::error::Plate.app carries get-task-allow; notarization would reject it."
+            exit 1
+          fi
+
+      - name: Notarize + staple Plate.app (${{ matrix.arch }})
+        if: steps.signing.outputs.signed == 'true'
+        working-directory: PlateApp/build/Build/Products/Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/notary_key.p8"
+          echo "$NOTARY_KEY_P8" | base64 --decode > "$KEY"
+          trap 'rm -f "$KEY"' EXIT
+
+          # notarytool only accepts zip/dmg/pkg, so the .app rides in a zip.
+          # ditto (not plain zip) keeps extended attributes and symlinks intact.
+          ditto -c -k --keepParent Plate.app Plate-notarize.zip
+          xcrun notarytool submit Plate-notarize.zip \
+            --key "$KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait
+          rm -f Plate-notarize.zip
+
+          # Staple the ticket to the .app itself, not just to the DMG: once a
+          # user drags the app out, the disk image's ticket no longer covers it
+          # and a first launch offline would be refused.
+          xcrun stapler staple Plate.app
+
+      - name: Build + sign the DMG (${{ matrix.arch }})
+        working-directory: PlateApp/build/Build/Products/Release
+        shell: bash
+        env:
+          SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+        run: |
+          set -euo pipefail
+          DMG="Plate-macos-${{ matrix.arch }}.dmg"
+          STAGE="$(mktemp -d)"
+          cp -R Plate.app "$STAGE/Plate.app"
+          # The conventional drag-to-install layout. A background image and
+          # window geometry would need `create-dmg`; this is the
+          # no-extra-dependency version.
+          ln -s /Applications "$STAGE/Applications"
+
+          hdiutil create -volname "Plate" -srcfolder "$STAGE" -ov -format UDZO "$DMG" > /dev/null
+          rm -rf "$STAGE"
+          codesign --force --sign "$SIGN_IDENTITY" --timestamp "$DMG"
+          echo "Built $DMG ($(du -h "$DMG" | cut -f1))"
+
+      - name: Notarize + staple the DMG (${{ matrix.arch }})
+        if: steps.signing.outputs.signed == 'true'
+        working-directory: PlateApp/build/Build/Products/Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          DMG="Plate-macos-${{ matrix.arch }}.dmg"
+          KEY="$RUNNER_TEMP/notary_key.p8"
+          echo "$NOTARY_KEY_P8" | base64 --decode > "$KEY"
+          trap 'rm -f "$KEY"' EXIT
+
+          # The DMG is its own distributable artifact, separate from the .app
+          # inside it: it needs its own submission and its own stapled ticket.
+          xcrun notarytool submit "$DMG" \
+            --key "$KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait
+          xcrun stapler staple "$DMG"
+
+          # What Gatekeeper will do on a user's machine, asserted in CI.
+          spctl --assess --type open --context context:primary-signature -vv "$DMG"
+
+      - name: Checksum the DMG (${{ matrix.arch }})
+        working-directory: PlateApp/build/Build/Products/Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          DMG="Plate-macos-${{ matrix.arch }}.dmg"
+          shasum -a 256 "$DMG" > "$DMG.sha256"
 
       # ---- plate-cli (this arch) ----
       - name: Build + package plate-cli (${{ matrix.arch }})
@@ -167,11 +327,20 @@ jobs:
         with:
           name: Plate-macos-${{ matrix.arch }}
           path: |
-            PlateApp/build/Build/Products/Release/Plate-macos-${{ matrix.arch }}.zip
-            PlateApp/build/Build/Products/Release/Plate-macos-${{ matrix.arch }}.zip.sha256
+            PlateApp/build/Build/Products/Release/Plate-macos-${{ matrix.arch }}.dmg
+            PlateApp/build/Build/Products/Release/Plate-macos-${{ matrix.arch }}.dmg.sha256
             plate-cli-macos-${{ matrix.arch }}.tar.gz
             plate-cli-macos-${{ matrix.arch }}.tar.gz.sha256
           retention-days: 90
+
+      # Runners are ephemeral, but a failed job can leave the keychain in the
+      # user search list for whatever runs next on a reused runner. Cheap to undo.
+      - name: Clean up the signing keychain
+        if: always() && steps.signing.outputs.signed == 'true'
+        shell: bash
+        run: |
+          security list-keychain -d user -s login.keychain-db
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
 
   # A single job attaches every arch's artifacts to one GitHub Release. Keeping
   # this out of the build matrix avoids two runners racing to create the same
