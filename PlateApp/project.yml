@@ -9,14 +9,37 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    ENABLE_HARDENED_RUNTIME: NO
-    CODE_SIGN_IDENTITY: "-"
+    # The paid team, which owns the "Developer ID Application" certificate.
+    # Not to be confused with the free personal team (PZKFWN2C3U) that the
+    # "Apple Development" certificate belongs to — signing a release with that
+    # one fails with "No certificate for team ... found".
+    DEVELOPMENT_TEAM: R6QM7B7GB7
     CODE_SIGN_STYLE: Manual
-    DEVELOPMENT_TEAM: ""
+    # Ad-hoc by default, so `xcodebuild` still works on a machine with no
+    # certificate at all (CI pull-request builds, fresh clones). Release
+    # builds override this on the command line with the real "Developer ID
+    # Application" identity — see scripts/release-macos.sh.
+    CODE_SIGN_IDENTITY: "-"
+  configs:
+    Debug:
+      # Hardened runtime blocks the debugger unless the build also carries
+      # get-task-allow, which in turn disqualifies it from notarization.
+      # Keep it off here and on in Release.
+      ENABLE_HARDENED_RUNTIME: NO
+    Release:
+      # Notarization rejects anything built without the hardened runtime.
+      ENABLE_HARDENED_RUNTIME: YES
+      # ...and rejects anything built *with* get-task-allow, which Xcode
+      # otherwise injects into the entitlements on our behalf. Verified: without
+      # this, a Release build comes out carrying it and notarization would fail.
+      CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
 
 packages:
   PlateCore:
     path: ..
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: "2.9.4"
 
 targets:
   PlateApp:
@@ -29,14 +52,15 @@ targets:
     dependencies:
       - package: PlateCore
         product: PlateCore
+      - package: Sparkle
+        product: Sparkle
     settings:
+      # Nothing signing-related belongs here: target settings outrank the
+      # project's per-configuration values above, so a stray
+      # ENABLE_HARDENED_RUNTIME here would silently win over Release's YES.
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lfkdsk.Plate
         PRODUCT_NAME: Plate
         MACOSX_DEPLOYMENT_TARGET: "10.15"
         INFOPLIST_FILE: PlateApp/Info.plist
         GENERATE_INFOPLIST_FILE: NO
-        ENABLE_HARDENED_RUNTIME: NO
-        CODE_SIGN_IDENTITY: "-"
-        CODE_SIGNING_REQUIRED: NO
-        CODE_SIGNING_ALLOWED: NO

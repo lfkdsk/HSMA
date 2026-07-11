@@ -23,6 +23,9 @@ PlateApp/PlateApp.xcodeproj/
 PlateApp/build/
 build/
 
+# Signed/notarized output of scripts/release-macos.sh
+dist/
+
 # Intermediate icon outputs — the .icns files committed under PlateApp/PlateApp/
 # are what the build needs. The .iconset/ directories and preview PNGs under
 # Branding/ are regeneratable from the source SVGs via scripts/build-icons.sh.

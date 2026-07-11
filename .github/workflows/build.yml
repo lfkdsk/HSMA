@@ -71,112 +71,339 @@ jobs:
           path: PlateApp/build/Build/Products/Debug/Plate.zip
           retention-days: 30
 
-  # Release builds the shippable per-architecture artifacts. The macos-15
-  # runner is Apple Silicon, so x86_64 is cross-compiled (ARCHS / --arch — the
-  # SDK carries both slices). arm64 and x86_64 are built *separately* (not a
-  # lipo'd universal binary). Each arch produces:
-  #   - Plate-macos-<arch>.zip          the .app, ad-hoc signed
-  #   - plate-cli-macos-<arch>.tar.gz   the CLI + its PlateCore resource bundle
-  # each with a .sha256 sidecar, uploaded as workflow artifacts. On a v* tag the
-  # separate publish-release job collects them into one GitHub Release.
+  # Release builds the shippable artifacts. The .app is a single universal
+  # binary (arm64 + x86_64) — Sparkle serves one download per update, and a
+  # universal build spares us a per-architecture feed. The macos-15 runner is
+  # Apple Silicon, so the x86_64 slice is cross-compiled (the SDK carries both).
+  # Produces:
+  #   - Plate-macos-universal.dmg      the .app, Developer ID signed + notarized
+  #   - plate-cli-macos-<arch>.tar.gz  the CLI + its PlateCore resource bundle
+  #   - appcast.xml                    the Sparkle feed (on v* tags only)
+  # each with a .sha256 sidecar where relevant, uploaded as workflow artifacts.
+  #
+  # Signing needs six repository secrets (see docs/SIGNING.md): the five for
+  # Developer ID + notarization, plus SPARKLE_PRIVATE_KEY for the update feed.
+  # When they are absent — a fork, or a repo not yet set up — the job falls back
+  # to ad-hoc signing and skips notarization + appcast, so the build still goes
+  # green. The DMG it produces is then NOT distributable; only tag builds from
+  # this repository are.
   build-release:
-    name: Release (${{ matrix.arch }})
+    name: Release (universal)
     needs: test-core
     runs-on: macos-15
     if: github.event_name != 'pull_request'
-    strategy:
-      # Don't let one arch failing cancel the other — we want whichever
-      # slice built so a partial release is still possible.
-      fail-fast: false
-      matrix:
-        arch: [arm64, x86_64]
+    env:
+      # `if:` conditions can't read `secrets`, so the steps below test these
+      # instead and branch in bash.
+      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+      NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+      NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+      SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install xcodegen + xcbeautify
         run: brew install xcodegen xcbeautify
 
-      # ---- macOS .app (this arch) ----
+      # Certificates can only be used from an unlocked keychain, and the
+      # runner's `login` keychain isn't one we can rely on. Build a throwaway
+      # keychain, import the .p12 into it, and make it searchable so codesign
+      # finds the identity by name.
+      - name: Import Developer ID certificate
+        id: signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${MACOS_CERTIFICATE_P12:-}" ]; then
+            echo "::warning::No signing secrets — falling back to ad-hoc, skipping notarization."
+            echo "identity=-" >> "$GITHUB_OUTPUT"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          CERT="$RUNNER_TEMP/certificate.p12"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # Without this the keychain re-locks after 5 minutes of idle and a
+          # slow build reaches codesign with nothing to sign with.
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$CERT"
+          security import "$CERT" -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$CERT"
+
+          # Authorises codesign to use the private key without an interactive
+          # "allow access?" prompt, which would hang the runner forever.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::The imported certificate is not a 'Developer ID Application' identity."
+            security find-identity -v -p codesigning "$KEYCHAIN"
+            exit 1
+          fi
+
+          echo "Using identity: $IDENTITY"
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "keychain=$KEYCHAIN" >> "$GITHUB_OUTPUT"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
       - name: Generate Xcode project
         working-directory: PlateApp
         run: xcodegen generate
 
-      - name: xcodebuild Release (${{ matrix.arch }})
+      - name: xcodebuild Release (universal)
         working-directory: PlateApp
         shell: bash
+        env:
+          NSUnbufferedIO: YES
+          SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          SIGNED: ${{ steps.signing.outputs.signed }}
+          KEYCHAIN: ${{ steps.signing.outputs.keychain }}
         run: |
-          set -o pipefail
+          set -euo pipefail
+          # A secure timestamp is required for notarization but unsupported for
+          # ad-hoc signatures, so it only goes on the real-identity path.
+          EXTRA=()
+          if [ "$SIGNED" = "true" ]; then
+            EXTRA+=(OTHER_CODE_SIGN_FLAGS="--timestamp --keychain $KEYCHAIN")
+          fi
+
+          # ARCHS with both slices + ONLY_ACTIVE_ARCH=NO yields a universal binary.
           xcodebuild \
             -project PlateApp.xcodeproj \
             -scheme PlateApp \
             -configuration Release \
             -derivedDataPath build \
             -destination 'platform=macOS' \
-            ARCHS=${{ matrix.arch }} \
+            ARCHS="arm64 x86_64" \
             ONLY_ACTIVE_ARCH=NO \
             build \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="$SIGN_IDENTITY" \
+            CODE_SIGN_STYLE=Manual \
+            ENABLE_HARDENED_RUNTIME=YES \
+            "${EXTRA[@]}" \
             | xcbeautify
-        env:
-          NSUnbufferedIO: YES
 
-      - name: Ad-hoc sign + zip Plate.app (${{ matrix.arch }})
+          BIN=build/Build/Products/Release/Plate.app/Contents/MacOS/Plate
+          echo "Architectures: $(lipo -archs "$BIN")"
+          for arch in arm64 x86_64; do
+            lipo -archs "$BIN" | grep -qw "$arch" \
+              || { echo "::error::universal build is missing the $arch slice"; exit 1; }
+          done
+
+      # xcodebuild re-signs the outer Sparkle.framework but leaves its nested
+      # helpers (Autoupdate, Updater.app, the XPC services) carrying Sparkle's
+      # own signature without a timestamp — which notarization rejects. Re-sign
+      # them inside-out with our identity. (Ad-hoc fork builds aren't notarized,
+      # so a plain --deep ad-hoc pass keeps them internally consistent instead.)
+      - name: Deep-sign Sparkle helpers
+        working-directory: PlateApp/build/Build/Products/Release
+        shell: bash
+        env:
+          SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          CODESIGN_KEYCHAIN: ${{ steps.signing.outputs.keychain }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+            "$GITHUB_WORKSPACE/scripts/codesign-app.sh" Plate.app
+          else
+            codesign --force --deep --sign - Plate.app
+          fi
+
+      - name: Verify the signature
+        if: steps.signing.outputs.signed == 'true'
         working-directory: PlateApp/build/Build/Products/Release
         shell: bash
         run: |
           set -euo pipefail
-          # Apple Silicon refuses to launch a fully-unsigned binary; an ad-hoc
-          # signature is the minimum that runs (mirrors the local release flow).
-          codesign --force --deep --sign - Plate.app
-          codesign --verify --deep --strict Plate.app
-          # ditto (not plain zip) keeps the bundle's extended attributes intact.
-          ZIP="Plate-macos-${{ matrix.arch }}.zip"
-          ditto -c -k --keepParent Plate.app "$ZIP"
-          shasum -a 256 "$ZIP" > "$ZIP.sha256"
-          echo "Built $ZIP ($(du -h "$ZIP" | cut -f1))"
+          codesign --verify --deep --strict --verbose=2 Plate.app
 
-      # ---- plate-cli (this arch) ----
-      - name: Build + package plate-cli (${{ matrix.arch }})
+          # Both are hard preconditions for notarization — get-task-allow
+          # disqualifies, a missing runtime flag disqualifies. Failing here
+          # beats failing five minutes into a notarytool round-trip.
+          #
+          # Capture before grepping, don't pipe: under `pipefail`, `grep -q`
+          # exits on its first match, codesign takes a SIGPIPE, and the pipeline
+          # reports 141 despite the match. `codesign -dvvv` writes enough to
+          # trip this every time; the entitlements output happens not to. It
+          # turns on output size against the pipe buffer, and the get-task-allow
+          # check would fail *open* — so neither is piped.
+          #
+          # Note the -dvvv: the "flags=" line only shows at verbosity 3.
+          SIGNATURE="$(codesign -dvvv Plate.app 2>&1)"
+          if ! printf '%s\n' "$SIGNATURE" | grep -qE "flags=[^ ]*runtime"; then
+            echo "::error::Plate.app is not signed with the hardened runtime."
+            exit 1
+          fi
+
+          ENTITLEMENTS="$(codesign --display --entitlements :- Plate.app 2>/dev/null || true)"
+          if printf '%s\n' "$ENTITLEMENTS" | grep -q get-task-allow; then
+            echo "::error::Plate.app carries get-task-allow; notarization would reject it."
+            exit 1
+          fi
+
+      - name: Notarize + staple Plate.app
+        if: steps.signing.outputs.signed == 'true'
+        working-directory: PlateApp/build/Build/Products/Release
         shell: bash
         run: |
           set -euo pipefail
-          swift build -c release --arch ${{ matrix.arch }} --product plate-cli
-          BIN="$(swift build -c release --arch ${{ matrix.arch }} --show-bin-path)"
+          KEY="$RUNNER_TEMP/notary_key.p8"
+          echo "$NOTARY_KEY_P8" | base64 --decode > "$KEY"
+          trap 'rm -f "$KEY"' EXIT
 
+          # notarytool only accepts zip/dmg/pkg, so the .app rides in a zip.
+          # ditto (not plain zip) keeps extended attributes and symlinks intact.
+          ditto -c -k --keepParent Plate.app Plate-notarize.zip
+          xcrun notarytool submit Plate-notarize.zip \
+            --key "$KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait
+          rm -f Plate-notarize.zip
+
+          # Staple the ticket to the .app itself, not just to the DMG: once a
+          # user drags the app out, the disk image's ticket no longer covers it
+          # and a first launch offline would be refused.
+          xcrun stapler staple Plate.app
+
+      - name: Build + sign the DMG
+        working-directory: PlateApp/build/Build/Products/Release
+        shell: bash
+        env:
+          SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+        run: |
+          set -euo pipefail
+          DMG="Plate-macos-universal.dmg"
           STAGE="$(mktemp -d)"
-          mkdir -p "$STAGE/plate-cli"
-          cp "$BIN/plate-cli" "$STAGE/plate-cli/"
-          # `serve` loads gallery.html from the PlateCore resource bundle that
-          # SwiftPM emits next to the binary — ship it alongside the CLI.
-          if [ -d "$BIN/Plate_PlateCore.bundle" ]; then
-            cp -R "$BIN/Plate_PlateCore.bundle" "$STAGE/plate-cli/"
+          cp -R Plate.app "$STAGE/Plate.app"
+          # The conventional drag-to-install layout. A background image and
+          # window geometry would need `create-dmg`; this is the
+          # no-extra-dependency version.
+          ln -s /Applications "$STAGE/Applications"
+
+          hdiutil create -volname "Plate" -srcfolder "$STAGE" -ov -format UDZO "$DMG" > /dev/null
+          rm -rf "$STAGE"
+          codesign --force --sign "$SIGN_IDENTITY" --timestamp "$DMG"
+          echo "Built $DMG ($(du -h "$DMG" | cut -f1))"
+
+      - name: Notarize + staple the DMG
+        if: steps.signing.outputs.signed == 'true'
+        working-directory: PlateApp/build/Build/Products/Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          DMG="Plate-macos-universal.dmg"
+          KEY="$RUNNER_TEMP/notary_key.p8"
+          echo "$NOTARY_KEY_P8" | base64 --decode > "$KEY"
+          trap 'rm -f "$KEY"' EXIT
+
+          # The DMG is its own distributable artifact, separate from the .app
+          # inside it: it needs its own submission and its own stapled ticket.
+          xcrun notarytool submit "$DMG" \
+            --key "$KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait
+          xcrun stapler staple "$DMG"
+
+          # What Gatekeeper will do on a user's machine, asserted in CI.
+          spctl --assess --type open --context context:primary-signature -vv "$DMG"
+
+      - name: Checksum the DMG
+        working-directory: PlateApp/build/Build/Products/Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          shasum -a 256 Plate-macos-universal.dmg > Plate-macos-universal.dmg.sha256
+
+      # ---- plate-cli (both arches, still per-slice) ----
+      - name: Build + package plate-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in arm64 x86_64; do
+            swift build -c release --arch "$arch" --product plate-cli
+            BIN="$(swift build -c release --arch "$arch" --show-bin-path)"
+
+            STAGE="$(mktemp -d)"
+            mkdir -p "$STAGE/plate-cli"
+            cp "$BIN/plate-cli" "$STAGE/plate-cli/"
+            # `serve` loads gallery.html from the PlateCore resource bundle that
+            # SwiftPM emits next to the binary — ship it alongside the CLI.
+            if [ -d "$BIN/Plate_PlateCore.bundle" ]; then
+              cp -R "$BIN/Plate_PlateCore.bundle" "$STAGE/plate-cli/"
+            fi
+            # ad-hoc sign so Apple Silicon will execute it.
+            codesign --force --sign - "$STAGE/plate-cli/plate-cli"
+
+            TAR="plate-cli-macos-$arch.tar.gz"
+            tar -C "$STAGE" -czf "$TAR" plate-cli
+            shasum -a 256 "$TAR" > "$TAR.sha256"
+            echo "Built $TAR ($(du -h "$TAR" | cut -f1))"
+          done
+
+      # ---- Sparkle appcast (signed releases on a v* tag only) ----
+      # The enclosure URL is the release asset's stable download URL, which is
+      # deterministic from the tag even before publish-release creates it.
+      - name: Generate Sparkle appcast
+        id: appcast
+        if: steps.signing.outputs.signed == 'true' && startsWith(github.ref, 'refs/tags/v')
+        working-directory: PlateApp/build/Build/Products/Release
+        shell: bash
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SPARKLE_PRIVATE_KEY:-}" ]; then
+            echo "::error::SPARKLE_PRIVATE_KEY is not set — cannot sign the update feed."
+            exit 1
           fi
-          # ad-hoc sign so Apple Silicon will execute it.
-          codesign --force --sign - "$STAGE/plate-cli/plate-cli"
+          URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/Plate-macos-universal.dmg"
+          "$GITHUB_WORKSPACE/scripts/make-appcast.sh" \
+            Plate.app Plate-macos-universal.dmg "$URL" > appcast.xml
+          echo "Generated appcast.xml:"
+          cat appcast.xml
+          echo "generated=true" >> "$GITHUB_OUTPUT"
 
-          TAR="plate-cli-macos-${{ matrix.arch }}.tar.gz"
-          tar -C "$STAGE" -czf "$TAR" plate-cli
-          shasum -a 256 "$TAR" > "$TAR.sha256"
-          echo "Built $TAR ($(du -h "$TAR" | cut -f1))"
-
-      # ---- upload (the publish-release job turns these into the Release) ----
-      - name: Upload artifacts (${{ matrix.arch }})
+      # ---- upload (publish-release + deploy-pages consume these) ----
+      - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Plate-macos-${{ matrix.arch }}
+          name: Plate-release
           path: |
-            PlateApp/build/Build/Products/Release/Plate-macos-${{ matrix.arch }}.zip
-            PlateApp/build/Build/Products/Release/Plate-macos-${{ matrix.arch }}.zip.sha256
-            plate-cli-macos-${{ matrix.arch }}.tar.gz
-            plate-cli-macos-${{ matrix.arch }}.tar.gz.sha256
+            PlateApp/build/Build/Products/Release/Plate-macos-universal.dmg
+            PlateApp/build/Build/Products/Release/Plate-macos-universal.dmg.sha256
+            plate-cli-macos-arm64.tar.gz
+            plate-cli-macos-arm64.tar.gz.sha256
+            plate-cli-macos-x86_64.tar.gz
+            plate-cli-macos-x86_64.tar.gz.sha256
           retention-days: 90
 
-  # A single job attaches every arch's artifacts to one GitHub Release. Keeping
-  # this out of the build matrix avoids two runners racing to create the same
-  # release, and means only this job needs `contents: write` (the matrix builds
-  # stay read-only). Runs on Linux — it only moves files, no Xcode needed.
+      - name: Upload appcast
+        if: steps.appcast.outputs.generated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: appcast
+          path: PlateApp/build/Build/Products/Release/appcast.xml
+          retention-days: 90
+
+      # Runners are ephemeral, but a failed job can leave the keychain in the
+      # user search list for whatever runs next on a reused runner. Cheap to undo.
+      - name: Clean up the signing keychain
+        if: always() && steps.signing.outputs.signed == 'true'
+        shell: bash
+        run: |
+          security list-keychain -d user -s login.keychain-db
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+  # Attaches the release artifacts to one GitHub Release. Runs on Linux — it
+  # only moves files, no Xcode needed — and is the only job needing
+  # `contents: write` (the build stays read-only).
   publish-release:
     name: Publish GitHub Release
     needs: build-release
@@ -188,19 +415,8 @@ jobs:
       - name: Download built artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: Plate-macos-*
-          path: dist
-          merge-multiple: true
-
-      # upload-artifact keeps each artifact's nested path (e.g. PlateApp/build/
-      # …/Plate-macos-arm64.zip). Flatten every file into one dir so the
-      # release upload is a simple, unambiguous glob — all 8 basenames are
-      # unique, so nothing collides.
-      - name: Flatten into a release dir
-        run: |
-          mkdir -p out
-          find dist -type f -exec cp {} out/ \;
-          ls -la out
+          name: Plate-release
+          path: out
 
       - name: Create / update the Release
         uses: softprops/action-gh-release@v2
@@ -209,3 +425,35 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publishes the Sparkle appcast to GitHub Pages, so the SUFeedURL in the app's
+  # Info.plist (https://<owner>.github.io/<repo>/appcast.xml) resolves. Runs
+  # after publish-release so the enclosure's download URL is already live.
+  # Requires Pages to be enabled with "GitHub Actions" as the source — see
+  # docs/SIGNING.md.
+  deploy-pages:
+    name: Deploy appcast to Pages
+    needs: publish-release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Download appcast
+        uses: actions/download-artifact@v4
+        with:
+          name: appcast
+          path: site
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

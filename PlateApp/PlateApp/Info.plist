@@ -17,9 +17,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.2.4</string>
+    <string>0.3.0</string>
     <key>CFBundleVersion</key>
-    <string>6</string>
+    <string>7</string>
     <key>LSMinimumSystemVersion</key>
     <string>$(MACOSX_DEPLOYMENT_TARGET)</string>
     <key>NSPrincipalClass</key>
@@ -28,6 +28,19 @@
     <string>© 2026 lfkdsk</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+
+    <!-- Sparkle auto-update. The feed is served from GitHub Pages; each
+         release's DMG is the enclosure, signed with the EdDSA key whose public
+         half is below. The private half lives only in the maintainer's keychain
+         and the SPARKLE_PRIVATE_KEY CI secret — see docs/SIGNING.md. -->
+    <key>SUFeedURL</key>
+    <string>https://lfkdsk.github.io/Plate/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>uPdkH8REDyUW2BNIWSNtr09u7/7Lc9Me24F3yZ6PaT0=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
 
     <key>CFBundleDocumentTypes</key>
     <array>

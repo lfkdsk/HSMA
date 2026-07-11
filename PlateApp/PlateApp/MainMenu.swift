@@ -20,9 +20,9 @@ enum MainMenu {
                            action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                            keyEquivalent: ""))
         menu.addItem(.separator())
-        // In-app update check — queries GitHub Releases and offers to open the
-        // download page when a newer version is published. Routed to the app
-        // delegate through the responder chain.
+        // In-app update check — driven by Sparkle, which downloads and installs
+        // a newer release in place. Routed to the app delegate through the
+        // responder chain, which forwards it to the Sparkle updater.
         menu.addItem(.init(title: "Check for Updates…",
                            action: #selector(AppDelegate.checkForUpdatesFromMenu(_:)),
                            keyEquivalent: ""))
