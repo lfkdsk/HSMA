@@ -31,15 +31,26 @@ SHORT_VERSION="$(read_plist CFBundleShortVersionString)"
 BUILD_VERSION="$(read_plist CFBundleVersion)"
 MIN_OS="$(read_plist LSMinimumSystemVersion 2>/dev/null || echo "10.15")"
 
-# Locate sign_update: honour an explicit path, otherwise take the newest one
+# Locate sign_update: honour an explicit path, otherwise take the first one
 # under the SPM artifacts (both DerivedData layouts are searched).
+#
+# Only roots that exist go into the search: `find` exits non-zero on a missing
+# root even when another root matched, and under `set -euo pipefail` that
+# killed the script with no message at all on CI, where the user-level
+# DerivedData directory doesn't exist (builds there use -derivedDataPath).
+# `-print -quit` instead of `| head -1` for the same reason — a pipe reader
+# exiting early SIGPIPEs the producer, and pipefail turns that into failure.
 SIGN_UPDATE="${SIGN_UPDATE:-}"
 if [ -z "$SIGN_UPDATE" ]; then
-    SIGN_UPDATE="$(find "$HOME/Library/Developer/Xcode/DerivedData" \
-        "$(dirname "$APP")/../../.." \
-        -path "*artifacts/sparkle/Sparkle/bin/sign_update" 2>/dev/null | head -1)"
+    ROOTS=()
+    [ -d "$HOME/Library/Developer/Xcode/DerivedData" ] && ROOTS+=("$HOME/Library/Developer/Xcode/DerivedData")
+    [ -d "$(dirname "$APP")/../../.." ] && ROOTS+=("$(dirname "$APP")/../../..")
+    if [ "${#ROOTS[@]}" -gt 0 ]; then
+        SIGN_UPDATE="$(find "${ROOTS[@]}" \
+            -path "*artifacts/sparkle/Sparkle/bin/sign_update" -print -quit 2>/dev/null || true)"
+    fi
 fi
-[ -x "$SIGN_UPDATE" ] || { echo "sign_update tool not found (set SIGN_UPDATE)" >&2; exit 1; }
+[ -n "$SIGN_UPDATE" ] && [ -x "$SIGN_UPDATE" ] || { echo "sign_update tool not found (set SIGN_UPDATE)" >&2; exit 1; }
 
 # `sign_update` prints ready-made enclosure attributes:
 #   sparkle:edSignature="…" length="…"
