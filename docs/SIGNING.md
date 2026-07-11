@@ -213,3 +213,14 @@ generated from the built app's `Info.plist`, so the two can't drift.
 The `deploy-pages` job publishes `appcast.xml`. For it to work, enable Pages
 with **Settings ▸ Pages ▸ Build and deployment ▸ Source = GitHub Actions**.
 Until then the feed 404s and the app simply never finds an update.
+
+Enabling Pages auto-creates a `github-pages` environment whose deployment
+policy only allows the `main` branch — but the deploy runs on `v*` **tags**,
+so its job is rejected before a single step runs, with no log to read. Allow
+tags once, in **Settings ▸ Environments ▸ github-pages ▸ Deployment branches
+and tags** (add tag rule `v*`), or:
+
+```sh
+gh api -X POST repos/<owner>/<repo>/environments/github-pages/deployment-branch-policies \
+    -f name='v*' -f type=tag
+```

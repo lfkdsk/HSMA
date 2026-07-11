@@ -371,17 +371,28 @@ jobs:
           echo "generated=true" >> "$GITHUB_OUTPUT"
 
       # ---- upload (publish-release + deploy-pages consume these) ----
+      # Staged flat first: upload-artifact keeps paths relative to the inputs'
+      # common ancestor, so mixing repo-root tarballs with the DMG's deep build
+      # path buried the DMG under PlateApp/build/… inside the artifact — where
+      # publish-release's `files: out/*` glob missed it, and v0.3.0 shipped
+      # without its DMG until it was attached by hand.
+      - name: Stage release artifacts flat
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-out
+          cp PlateApp/build/Build/Products/Release/Plate-macos-universal.dmg \
+             PlateApp/build/Build/Products/Release/Plate-macos-universal.dmg.sha256 \
+             plate-cli-macos-arm64.tar.gz  plate-cli-macos-arm64.tar.gz.sha256 \
+             plate-cli-macos-x86_64.tar.gz plate-cli-macos-x86_64.tar.gz.sha256 \
+             release-out/
+          ls -la release-out
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Plate-release
-          path: |
-            PlateApp/build/Build/Products/Release/Plate-macos-universal.dmg
-            PlateApp/build/Build/Products/Release/Plate-macos-universal.dmg.sha256
-            plate-cli-macos-arm64.tar.gz
-            plate-cli-macos-arm64.tar.gz.sha256
-            plate-cli-macos-x86_64.tar.gz
-            plate-cli-macos-x86_64.tar.gz.sha256
+          path: release-out/*
           retention-days: 90
 
       - name: Upload appcast
@@ -417,6 +428,14 @@ jobs:
         with:
           name: Plate-release
           path: out
+
+      # The appcast's enclosure URL points at the DMG on this release, so a
+      # release without it strands every Sparkle client. Refuse to publish one.
+      - name: Assert the DMG is present
+        run: |
+          ls -la out
+          test -f out/Plate-macos-universal.dmg
+          test -f out/Plate-macos-universal.dmg.sha256
 
       - name: Create / update the Release
         uses: softprops/action-gh-release@v2
