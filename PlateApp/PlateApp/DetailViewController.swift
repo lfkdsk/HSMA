@@ -741,6 +741,12 @@ final class DetailViewController: NSViewController {
             scroll.topAnchor.constraint(equalTo: view.topAnchor),
             scroll.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
+        // Constraints only resolve on the next layout pass, but showHDR calls
+        // fitHDRToView immediately after this returns — with a zero frame the
+        // fit guard bails, magnification stays at the default 1.0 (1:1 pixels),
+        // and viewDidLayout never repairs it (it only refits when already at
+        // fit). Force layout now so the first HDR photo opens fitted.
+        view.layoutSubtreeIfNeeded()
         hdrImageView = hdrView
         hdrScrollView = scroll
         return hdrView
@@ -970,8 +976,8 @@ final class DetailViewController: NSViewController {
     private static func loadHDRImage(url: URL) -> CIImage? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
 
-        // Gain-map HDR — the dominant case. Cheap: probes only the auxiliary-data
-        // header, no full-image decode. Two keys matter and a file may set just
+        // Gain-map HDR — the dominant case. Copies the (small) auxiliary gain-map
+        // image out but never decodes the main image. Two keys matter and a file may set just
         // ONE: Apple's HDRGainMap (iPhone HEIC sets this, often both) and the
         // ISO 21496-1 ISOGainMap (macOS 15+). Hasselblad/Phocus exports — and
         // Google Ultra HDR — write the ISO gain map WITHOUT Apple's key, so a
@@ -1002,10 +1008,58 @@ final class DetailViewController: NSViewController {
         // a harmless no-op (their headroom already lives in the transfer function).
         // applyOrientationProperty rotates per EXIF, matching the SDR thumbnail
         // path's kCGImageSourceCreateThumbnailWithTransform.
-        return CIImage(contentsOf: url, options: [
+        guard let recipe = CIImage(contentsOf: url, options: [
             .applyOrientationProperty: true,
             .expandToHDR: true,
+        ]) else { return nil }
+
+        // CIImage(contentsOf:) is lazy — nothing above has decoded the main image
+        // yet. Handed off as-is, the full-resolution decode + gain-map expand
+        // would run inside HDRImageView.render() on the MAIN thread (seconds of
+        // frozen navigation for a 100MP file, re-paid on every layout because the
+        // view's context doesn't cache intermediates). Pre-render here, on the
+        // caller's background queue, into a bitmap capped at the SDR path's long
+        // edge, so render() is just a GPU blit of an already-decoded image.
+        return prerenderHDR(recipe)
+    }
+
+    /// Shared render context for `prerenderHDR`. A CIContext is expensive to
+    /// create; one long-lived instance also keeps its decoder caches warm across
+    /// navigations. Wrapped in an enum because stored properties can't carry
+    /// `@available`.
+    @available(macOS 14.0, *)
+    private enum HDRPrerender {
+        static let colorSpace = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)!
+        static let context = CIContext(options: [
+            .workingColorSpace: colorSpace,
+            .cacheIntermediates: false,
+            .name: "PlateHDRPrerender",
         ])
+    }
+
+    /// Force-decode a lazy HDR `CIImage` into a bitmap-backed one, downsampled so
+    /// the long edge fits `HDRImageView.maxDrawablePixels` (mirrors the SDR
+    /// path's 4096px decode cap). Half-float in extended-linear Display P3 keeps
+    /// values above 1.0, so EDR headroom survives the round-trip. Blocking —
+    /// call off-main; that's the point.
+    @available(macOS 14.0, *)
+    private static func prerenderHDR(_ image: CIImage) -> CIImage? {
+        let extent = image.extent
+        guard extent.width > 0, extent.height > 0 else { return nil }
+        let target = HDRImageView.displaySize(forExtent: extent)
+        let scaled = image
+            .transformed(by: CGAffineTransform(translationX: -extent.origin.x,
+                                               y: -extent.origin.y))
+            .transformed(by: CGAffineTransform(scaleX: target.width / extent.width,
+                                               y: target.height / extent.height))
+        guard let cg = HDRPrerender.context.createCGImage(
+            scaled,
+            from: CGRect(origin: .zero, size: target),
+            format: .RGBAh,
+            colorSpace: HDRPrerender.colorSpace,
+            deferred: false     // decode NOW, on this background queue
+        ) else { return nil }
+        return CIImage(cgImage: cg)
     }
 
     // MARK: - Actions
