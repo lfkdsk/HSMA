@@ -4,6 +4,7 @@ import Sparkle
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var welcomeWC: WelcomeWindowController?
+    private var settingsWC: SettingsWindowController?
     private var didBecomeKeyObserver: Any?
 
     /// Sparkle's turnkey controller: owns the updater and the standard user
@@ -48,6 +49,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// app is up to date.
     @objc func checkForUpdatesFromMenu(_ sender: Any?) {
         updaterController?.checkForUpdates(sender)
+    }
+
+    /// App ▸ Settings… (⌘,) — one shared window, created on first use.
+    @objc func showSettingsFromMenu(_ sender: Any?) {
+        if settingsWC == nil { settingsWC = SettingsWindowController() }
+        settingsWC?.showWindow(sender)
+        settingsWC?.window?.makeKeyAndOrderFront(sender)
     }
 
     /// Reopens the most recent library if one exists, otherwise shows the welcome

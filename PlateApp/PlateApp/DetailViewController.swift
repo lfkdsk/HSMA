@@ -518,12 +518,17 @@ final class DetailViewController: NSViewController {
         loadedAtMaxPixel = 0
         let url = library.absoluteURL(forRelative: asset.primary)
         let targetMaxPixel = Self.fastMaxPixel
+        // Read once on main so one navigation is all-HDR or all-SDR; a Settings
+        // toggle mid-flight applies from the next photo.
+        let hdrEnabled = PlateSettings.hdrDisplayEnabled
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // Probe for HDR first. On macOS 14+ an HDR photo (gain map / PQ / HLG)
-            // decodes to an extended-range CIImage we route to the EDR surface;
-            // everything else falls through to the unchanged NSImageView path.
+            // Probe for HDR first (skipped when disabled in Settings — that also
+            // skips the gain-map probe, so the SDR path stays as fast as ever).
+            // On macOS 14+ an HDR photo (gain map / PQ / HLG) decodes to an
+            // extended-range CIImage we route to the EDR surface; everything
+            // else falls through to the unchanged NSImageView path.
             var hdrImage: CIImage?
-            if #available(macOS 14.0, *) {
+            if hdrEnabled, #available(macOS 14.0, *) {
                 hdrImage = Self.loadHDRImage(url: url)
             }
             if let hdrImage = hdrImage {
@@ -1003,6 +1008,24 @@ final class DetailViewController: NSViewController {
         }
 
         guard hasGainMap || isPQorHLG else { return nil }
+
+        // Fast path: one ImageIO pass decodes the file downsampled AND
+        // HDR-expanded. Measured on a 101MP Hasselblad ISO-gain-map HEIC:
+        // ~0.7s here vs ~5.3s for the full-resolution Core Image decode below.
+        // bitsPerComponent > 8 confirms the decoder honored DecodeToHDR (a
+        // silently-SDR result comes back 8-bit); if it didn't, fall through to
+        // the slow-but-certain CI path rather than showing HDR photos flat.
+        let thumbOpts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: Int(HDRImageView.maxDrawablePixels),
+            kCGImageSourceDecodeRequest: kCGImageSourceDecodeToHDR,
+        ]
+        if let thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOpts as CFDictionary),
+           thumb.bitsPerComponent > 8 {
+            return CIImage(cgImage: thumb)
+        }
 
         // expandToHDR folds a gain map into extended-range values; for PQ/HLG it's
         // a harmless no-op (their headroom already lives in the transfer function).

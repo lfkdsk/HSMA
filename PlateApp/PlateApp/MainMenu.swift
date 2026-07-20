@@ -27,6 +27,10 @@ enum MainMenu {
                            action: #selector(AppDelegate.checkForUpdatesFromMenu(_:)),
                            keyEquivalent: ""))
         menu.addItem(.separator())
+        menu.addItem(.init(title: "Settings…",
+                           action: #selector(AppDelegate.showSettingsFromMenu(_:)),
+                           keyEquivalent: ","))
+        menu.addItem(.separator())
         let hideOthers = NSMenuItem(title: "Hide Others",
                                     action: #selector(NSApplication.hideOtherApplications(_:)),
                                     keyEquivalent: "h")
